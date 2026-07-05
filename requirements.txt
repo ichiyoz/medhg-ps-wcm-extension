@@ -1,0 +1,15 @@
+numpy>=1.26
+pandas>=2.0
+scikit-learn>=1.4
+scipy>=1.12
+torch>=2.2
+dgl>=2.0
+gensim>=4.4
+optuna>=4.0
+xgboost>=3.0
+lightgbm>=4.5
+node2vec>=0.5
+networkx>=3.0
+matplotlib>=3.8
+python-docx>=1.0
+pgeocode>=0.5
