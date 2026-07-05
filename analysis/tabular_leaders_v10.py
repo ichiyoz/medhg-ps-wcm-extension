@@ -103,6 +103,31 @@ def run_cv(X, y, learner_factory, name):
     return p_oof
 
 
+def run_cv_fold_local(merged, feat_cols, cpt_arr, XB, XC, X_dispo,
+                     y, learner_factory, name, use_enriched=True):
+    """Same as run_cv but refits Block A (StandardScaler + CPT OneHotEncoder)
+    AND Block H (geocode NaN medians) inside each fold on train rows only,
+    avoiding leakage from full-cohort preprocessing. If use_enriched is False,
+    only Block A is used."""
+    from analysis.final_push_080 import make_H
+    N = len(y)
+    p_oof = np.full(N, np.nan)
+    skf = StratifiedKFold(5, shuffle=True, random_state=SEED)
+    for fi, (tr, te) in enumerate(skf.split(np.zeros(N), y)):
+        train_mask = np.zeros(N, bool); train_mask[tr] = True
+        XA_fold = make_A(merged, feat_cols, cpt_arr, train_mask)
+        if use_enriched:
+            XH_fold, _ = make_H(merged, train_mask=train_mask)
+            X_fold = np.hstack([XA_fold, XB, XC, XH_fold, X_dispo]).astype(np.float32)
+        else:
+            X_fold = XA_fold.astype(np.float32)
+        est = CalibratedClassifierCV(
+            learner_factory(), method="isotonic", cv=3).fit(X_fold[tr], y[tr])
+        p_oof[te] = est.predict_proba(X_fold[te])[:, 1]
+        log(f"  {name} fold {fi + 1} done  X_fold {X_fold.shape}")
+    return p_oof
+
+
 def eval_oof(y, p, name):
     au = roc_auc_score(y, p); ap = average_precision_score(y, p)
     au_ci = _boot_ci(y, p, roc_auc_score, 0)
@@ -154,9 +179,13 @@ def main():
     X_dispo = dispo.isin(HOME_LABELS).astype(np.float32).values.reshape(-1, 1)
     log(f"  X_dispo {X_dispo.shape}  home_rate {X_dispo.mean():.3f}")
 
+    # NOTE: XA is built here only for shape logging + fallback score computation
+    # (LACE / HOSPITAL). All CV rows below use `run_cv_fold_local`, which refits
+    # StandardScaler + CPT OneHotEncoder on each training fold to prevent test-
+    # fold statistics from leaking into preprocessing.
     train_mask_full = np.ones(N, bool)
     XA = make_A(merged, feat_cols, cpt_arr, train_mask_full)
-    log(f"  A {XA.shape}")
+    log(f"  A {XA.shape}  (shape only — CV re-fits preprocessing per fold)")
 
     results = []
     oofs = {}
@@ -175,18 +204,20 @@ def main():
     except FileNotFoundError as e:
         log(f"LACE/HOSPITAL cache miss: {e}. Skipping clinical-score rows.")
 
-    # 2. rf_clin — A only (clinical features + CPT)
-    log("running rf_clin (A only)")
-    p_rf_clin = run_cv(XA, y, lambda: learner_rf(), "rf_clin")
+    # 2. rf_clin — A only (clinical features + CPT), fold-local preprocessing
+    log("running rf_clin (A only, per-fold preprocessing)")
+    p_rf_clin = run_cv_fold_local(merged, feat_cols, cpt_arr, XB, XC,
+                                   X_dispo, y, lambda: learner_rf(),
+                                   "rf_clin", use_enriched=False)
     r = eval_oof(y, p_rf_clin, "RF — clinical features only (rf_clin)")
     log(f"  {r['model']:60s} AUROC {r['auroc']:.3f} ({r['auroc_lo']:.3f}-{r['auroc_hi']:.3f}) AUPRC {r['auprc']:.3f}")
     results.append(r); oofs["rf_clin"] = p_rf_clin
 
-    # 3. rf_big enriched (A + B + C + H + dispo, untuned)
-    log("running rf_big enriched (A + B + C + H + dispo)")
-    X_enr = np.hstack([XA, XB, XC, XH, X_dispo]).astype(np.float32)
-    log(f"  enriched matrix {X_enr.shape}")
-    p_rfe = run_cv(X_enr, y, lambda: learner_rf(big=True), "rf_big_enr")
+    # 3. rf_big enriched (A + B + C + H + dispo, untuned), fold-local preprocessing
+    log("running rf_big enriched (A + B + C + H + dispo, per-fold preprocessing)")
+    p_rfe = run_cv_fold_local(merged, feat_cols, cpt_arr, XB, XC,
+                               X_dispo, y, lambda: learner_rf(big=True),
+                               "rf_big_enr", use_enriched=True)
     r = eval_oof(y, p_rfe, "RF — enriched (A + B + C + H + dispo, untuned)")
     log(f"  {r['model']:60s} AUROC {r['auroc']:.3f} ({r['auroc_lo']:.3f}-{r['auroc_hi']:.3f}) AUPRC {r['auprc']:.3f}")
     results.append(r); oofs["rf_big_enr"] = p_rfe
@@ -201,14 +232,16 @@ def main():
         colsample_bytree=0.65, reg_lambda=0.13, reg_alpha=0.001,
         class_weight=None, random_state=SEED, n_jobs=-1, verbosity=-1,
     )
-    p_lgbm = run_cv(X_enr, y, lambda: lgb.LGBMClassifier(**lgbm_params),
-                    "lgbm_tuned")
+    p_lgbm = run_cv_fold_local(merged, feat_cols, cpt_arr, XB, XC,
+                                X_dispo, y,
+                                lambda: lgb.LGBMClassifier(**lgbm_params),
+                                "lgbm_tuned", use_enriched=True)
     r = eval_oof(y, p_lgbm, "LightGBM tuned (enriched + dispo)")
     log(f"  {r['model']:60s} AUROC {r['auroc']:.3f} ({r['auroc_lo']:.3f}-{r['auroc_hi']:.3f}) AUPRC {r['auprc']:.3f}")
     results.append(r); oofs["lgbm_tuned"] = p_lgbm
 
-    # 5. XGBoost (best of tuning trial results)
-    log("running XGBoost (using tuning-derived params)")
+    # 5. XGBoost (best of tuning trial results), fold-local preprocessing
+    log("running XGBoost (using tuning-derived params, per-fold preprocessing)")
     xgb_params = dict(
         n_estimators=300, learning_rate=0.018, max_depth=4,
         min_child_weight=1, subsample=0.79, colsample_bytree=0.84,
@@ -216,8 +249,10 @@ def main():
         tree_method="hist", eval_metric="logloss",
         random_state=SEED, n_jobs=-1, verbosity=0, use_label_encoder=False,
     )
-    p_xgb = run_cv(X_enr, y, lambda: xgb.XGBClassifier(**xgb_params),
-                   "xgb_tuned")
+    p_xgb = run_cv_fold_local(merged, feat_cols, cpt_arr, XB, XC,
+                               X_dispo, y,
+                               lambda: xgb.XGBClassifier(**xgb_params),
+                               "xgb_tuned", use_enriched=True)
     r = eval_oof(y, p_xgb, "XGBoost tuned (enriched + dispo)")
     log(f"  {r['model']:60s} AUROC {r['auroc']:.3f} ({r['auroc_lo']:.3f}-{r['auroc_hi']:.3f}) AUPRC {r['auprc']:.3f}")
     results.append(r); oofs["xgb_tuned"] = p_xgb

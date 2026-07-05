@@ -103,21 +103,37 @@ def make_xgb():
         random_state=SEED, n_jobs=-1, verbosity=0, use_label_encoder=False)
 
 
-def run_ensemble_cv(X_full, y, name, get_extra_features=None):
+def run_ensemble_cv(X_full, y, name, get_extra_features=None,
+                    merged=None, feat_cols=None, cpt_arr=None,
+                    XB=None, XC=None, X_dispo=None):
     """Run 5-fold with rf_big + LGBM + XGB, ensemble = mean.
     get_extra_features(train_idx) returns a per-fold N x D feature block
-    (or None). If given, extra features are concatenated to X_full each fold."""
+    (or None). If given, extra features are concatenated to X_full each fold.
+
+    If merged/feat_cols/cpt_arr/XB/XC/X_dispo are provided, Blocks A and H are
+    refit inside each fold (train-only preprocessing) instead of using the
+    precomputed full-cohort X_full — matches the fold-local pattern used in
+    tabular_leaders_v10.py."""
+    from analysis.final_push_080 import make_H as _make_H_local
     N = len(y)
     p_rf = np.full(N, np.nan)
     p_lgbm = np.full(N, np.nan)
     p_xgb = np.full(N, np.nan)
     skf = StratifiedKFold(5, shuffle=True, random_state=SEED)
+    fold_local = merged is not None
     for fi, (tr, te) in enumerate(skf.split(np.zeros(N), y)):
+        if fold_local:
+            train_mask = np.zeros(N, bool); train_mask[tr] = True
+            XA_fold = make_A(merged, feat_cols, cpt_arr, train_mask)
+            XH_fold, _ = _make_H_local(merged, train_mask=train_mask)
+            X_base = np.hstack([XA_fold, XB, XC, XH_fold, X_dispo]).astype(np.float32)
+        else:
+            X_base = X_full
         if get_extra_features is not None:
             X_extra = get_extra_features(tr)
-            X = np.hstack([X_full, X_extra]).astype(np.float32)
+            X = np.hstack([X_base, X_extra]).astype(np.float32)
         else:
-            X = X_full.astype(np.float32)
+            X = X_base.astype(np.float32)
         try:
             est = CalibratedClassifierCV(learner_rf(big=True),
                                           method="isotonic", cv=3).fit(X[tr], y[tr])
@@ -210,7 +226,9 @@ def main():
             merged, feat_cols, cpt_arr, y, tr, raw, prov_ids, X_prov,
             unit_ids, X_unit, fold_seed=SEED)
     p_medhg_orig = run_ensemble_cv(X_backbone, y, "medhg_orig",
-                                    _get_medhgps_orig)
+                                    _get_medhgps_orig,
+                                    merged=merged, feat_cols=feat_cols,
+                                    cpt_arr=cpt_arr, XB=XB, XC=XC, X_dispo=X_dispo)
     if p_medhg_orig is not None:
         r = _eval(y, p_medhg_orig, "MedHG-PS (original)")
         log(f"  {r['model']:35s} AUROC {r['auroc']:.3f} ({r['auroc_lo']:.3f}-{r['auroc_hi']:.3f}) AUPRC {r['auprc']:.3f}")
@@ -227,7 +245,9 @@ def main():
             merged, feat_cols, cpt_arr, y, tr, raw_og, prov_ids, X_prov,
             og_ids, X_og, fold_seed=SEED)
     p_medhg_ord = run_ensemble_cv(X_backbone, y, "medhg_orders",
-                                   _get_medhgps_orders)
+                                   _get_medhgps_orders,
+                                   merged=merged, feat_cols=feat_cols,
+                                   cpt_arr=cpt_arr, XB=XB, XC=XC, X_dispo=X_dispo)
     if p_medhg_ord is not None:
         r = _eval(y, p_medhg_ord, "MedHG-PS (orders as A3)")
         log(f"  {r['model']:35s} AUROC {r['auroc']:.3f} ({r['auroc_lo']:.3f}-{r['auroc_hi']:.3f}) AUPRC {r['auprc']:.3f}")
@@ -282,6 +302,10 @@ def main():
     log(f"  X_n2v {X_n2v.shape}")
 
     X_n2v_full = np.hstack([X_backbone, X_n2v]).astype(np.float32)
+    # Node2Vec + trees intentionally uses the precomputed transductive
+    # X_n2v_full (backbone + Node2Vec embedding). Node2Vec walks are
+    # transductive by design — retaining full-cohort preprocessing here is
+    # correct for the transductive interpretation reported in the manuscript.
     p_n2v = run_ensemble_cv(X_n2v_full, y, "n2v_trees", None)
     if p_n2v is not None:
         r = _eval(y, p_n2v, "Node2Vec + trees")
@@ -304,7 +328,9 @@ def main():
         return np.hstack([E["E_deg"], E["E_lp"], E["E_svd"],
                           X_n2v_rich]).astype(np.float32)
     p_rich = run_ensemble_cv(X_backbone, y, "tree_graph_v8",
-                              _get_rich_graph_features)
+                              _get_rich_graph_features,
+                              merged=merged, feat_cols=feat_cols,
+                              cpt_arr=cpt_arr, XB=XB, XC=XC, X_dispo=X_dispo)
     if p_rich is not None:
         r = _eval(y, p_rich, "Tree-based graph (v8 nodes)")
         log(f"  {r['model']:35s} AUROC {r['auroc']:.3f} ({r['auroc_lo']:.3f}-{r['auroc_hi']:.3f}) AUPRC {r['auprc']:.3f}")

@@ -317,7 +317,13 @@ def train_gru_and_encode(order_seqs, time_seqs, src_seqs, lens,
                          y, tr, n_orders, n_source, epochs=5, seed=SEED):
     """Train GRU on train indices, extract encoder state for all rows."""
     torch.manual_seed(seed)
-    model = MultiAttrSeqGRU(n_orders, n_source, n_source).to(DEV)
+    # BUGFIX: previous version passed n_source twice, sizing the time embedding
+    # from the source vocab (=2) even though time buckets range 1..6. This
+    # produced out-of-range index accesses that PyTorch handled silently on MPS,
+    # yielding garbage embeddings for later time buckets. Fixed by sizing the
+    # time embedding from the actual bucket range in the data.
+    n_time = int(np.asarray(time_seqs).max())
+    model = MultiAttrSeqGRU(n_orders, n_time, n_source).to(DEV)
     # class weights
     y_tr = y[tr]
     pos_w = torch.tensor([(y_tr == 0).sum() / max(1, (y_tr == 1).sum())],

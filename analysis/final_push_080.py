@@ -352,7 +352,7 @@ def compute_bert_notes(notes_df, all_logids, batch_size=64, max_len=128):
 # ============================================================
 # BLOCK H - geocode
 # ============================================================
-def make_H(merged):
+def make_H(merged, train_mask=None):
     import pgeocode
     nomi = pgeocode.Nominatim("us")
     # WCM main location: 525 East 68th St, NYC = zip 10065
@@ -395,9 +395,16 @@ def make_H(merged):
     inc = np.zeros(len(zip5))
     inc[zip5.isin(HI_INC).values] = 1
     inc[zip5.isin(LOW_INC).values] = -1
-    # fill nans
-    dist_wcm = np.nan_to_num(dist_wcm, nan=np.nanmedian(dist_wcm))
-    dist_nyp = np.nan_to_num(dist_nyp, nan=np.nanmedian(dist_nyp))
+    # fill NaN with training-fold median if provided; otherwise fall back to
+    # full-cohort median (used only for shape logging / non-CV rows).
+    if train_mask is None:
+        med_w = np.nanmedian(dist_wcm)
+        med_n = np.nanmedian(dist_nyp)
+    else:
+        med_w = np.nanmedian(dist_wcm[train_mask])
+        med_n = np.nanmedian(dist_nyp[train_mask])
+    dist_wcm = np.nan_to_num(dist_wcm, nan=med_w)
+    dist_nyp = np.nan_to_num(dist_nyp, nan=med_n)
     Xh = np.column_stack([dist_wcm, dist_nyp, b.astype(float), is_nyc,
                           is_manh, inc]).astype(np.float32)
     cols = ["dist_wcm","dist_nyp","dist_wcm_bin","is_nyc","is_manhattan","zip_inc_band"]
